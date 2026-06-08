@@ -27,21 +27,26 @@
 
 #define HEADER_INPUT 0xF0
 #define HEADER_OUTPUT 0xF1
-#define CMD_GET 0xA1
-#define CMD_SET 0xB1
-#define CMD_XXX_176 0xB0
-#define CMD_XXX_193 0xC1
 
-#define VOLTAGE_SET 193
-#define CURRENT_SET 194
-#define VOLTAGE_CURRENT_POWER_GET 195
-#define OUTPUT_ENABLE 219
-#define MODEL_NAME 222
-#define HARDWARE_VERSION 223
-#define FIRMWARE_VERSION 224
-#define METERING_ENABLE 216
-#define OVP 209
-#define OCP 210
+#define CMD_READ 0xA1
+#define CMD_WRITE 0xB1
+#define CMD_BAUD 0xB0
+#define CMD_SESSION 0xC1
+
+#define REG_W_VOLTAGE 0xC1
+#define REG_W_CURRENT 0xC2
+#define REG_OUTPUT_VIP 0xC3
+#define REG_W_OUTPUT 0xDB
+#define REG_MODEL 0xDE
+#define REG_HW_VERSION 0xDF
+#define REG_FW_VERSION 0xE0
+#define REG_W_METERING 0xD8
+#define REG_W_OVP 0xD1
+#define REG_W_OCP 0xD2
+#define REG_W_OPP 0xD3
+#define REG_W_OTP 0xD4
+#define REG_W_LVP 0xD5
+#define REG_DEVICE_ADDR 0xE1
 
 #define SOFTWARE_VERSION "1.0"
 
@@ -110,6 +115,13 @@ void send_command(uint8_t c1, uint8_t c2, uint8_t c3, uint8_t *c5, uint8_t c4) {
   command[3] = c4;
   memcpy(&command[4], c5, c4);
   command[4 + c4] = c6;
+  
+  if (debug) {
+      printf("Sent: %02X %02X %02X %02X ", command[0], command[1], command[2], command[3]);
+      for(int i=0; i<command[3]; i++) printf("%02X ", command[4+i]);
+      printf("%02X\n", command[4+command[3]]);
+  }
+  
   (void)write(serial_fd, command, sizeof(command));
   usleep(50000);
 }
@@ -139,56 +151,73 @@ void print_printable_string(const char *label, uint8_t *data, int length) {
 void receive_response(int response_type) {
   uint8_t buffer[1024];
 
+  fd_set read_fds;
+  FD_ZERO(&read_fds);
+  FD_SET(serial_fd, &read_fds);
+  
+  struct timeval timeout;
+  timeout.tv_sec = 0;
+  timeout.tv_usec = 100000; // 100ms
+  
+  int ret = select(serial_fd + 1, &read_fds, NULL, NULL, &timeout);
+  if (ret <= 0) return; // Timeout or error
+
   int bytes_read = read(serial_fd, buffer, sizeof(buffer));
   if (bytes_read > 0) {
-    /* Print raw data for debugging */
     if (debug) {
-      printf("Received: ");
-      for (int i = 0; i < bytes_read; i++) {
-        if (buffer[i] >= 0x20 && buffer[i] <= 0x7E) {
-          printf("%02X (%03d) '%c'\n", buffer[i], buffer[i], buffer[i]);
-        } else {
-          printf("%02X (%03d) '?'\n", buffer[i], buffer[i]);
-        }
-      }
-      printf("\n");
+      printf("Received %d bytes\n", bytes_read);
     }
-
-    if (bytes_read > 6 && buffer[0] == HEADER_INPUT && buffer[1] == CMD_GET) {
-      uint8_t cmd_type = buffer[2];
-      float value;
-      memcpy(&value, &buffer[4], sizeof(float));
-
-      switch (cmd_type) {
-      case VOLTAGE_SET:
-        printf("Output Voltage: %.2fV\n", value);
-        break;
-      case CURRENT_SET:
-        printf("Output Current: %.2fA\n", value);
-        break;
-      case VOLTAGE_CURRENT_POWER_GET:
-        if (is_bit_set(response_type, 0))
-          printf("Output Voltage: %.2f V\n", value);
-        if (is_bit_set(response_type, 1)) {
-          memcpy(&value, &buffer[4 + 4], sizeof(float));
-          printf("Output Current: %.3f A\n", value);
+    for (int i = 0; i < bytes_read - 4; i++) {
+      if (buffer[i] == HEADER_INPUT && buffer[i+1] == CMD_READ) {
+        uint8_t cmd_type = buffer[i+2];
+        uint8_t payload_len = buffer[i+3];
+        if (i + 5 + payload_len <= bytes_read) {
+          switch (cmd_type) {
+          case REG_W_VOLTAGE:
+            {
+              float value;
+              memcpy(&value, &buffer[i+4], 4);
+              printf("Output Voltage: %.2fV\n", value);
+            }
+            break;
+          case REG_W_CURRENT:
+            {
+              float value;
+              memcpy(&value, &buffer[i+4], 4);
+              printf("Output Current: %.2fA\n", value);
+            }
+            break;
+          case REG_OUTPUT_VIP:
+            break;
+          case 222:
+            print_printable_string("Device Model: ", &buffer[i+4], payload_len);
+            break;
+          case 223:
+            print_printable_string("Hardware Version: ", &buffer[i+4], payload_len);
+            break;
+          case 224:
+            print_printable_string("Firmware Version: ", &buffer[i+4], payload_len);
+            break;
+          case 225:
+            printf("Device ID: %d\n", buffer[i+4]);
+            break;
+          case 255:
+            if (payload_len >= 139) {
+              float v, a, w;
+              memcpy(&v, &buffer[i+4 + 12], 4);
+              memcpy(&a, &buffer[i+4 + 16], 4);
+              memcpy(&w, &buffer[i+4 + 20], 4);
+              if (is_bit_set(response_type, 0)) printf("Output Voltage: %.2f V\n", v);
+              if (is_bit_set(response_type, 1)) printf("Output Current: %.3f A\n", a);
+              if (is_bit_set(response_type, 2)) printf("Output Power: %.2f W\n", w);
+            }
+            break;
+          case 192:
+          case 196:
+            break;
+          }
+          i += (4 + payload_len); // skip the parsed packet
         }
-        if (is_bit_set(response_type, 2)) {
-          memcpy(&value, &buffer[4 + 8], sizeof(float));
-          printf("Output Power: %.2f W\n", value);
-        }
-        break;
-      case 222:
-        print_printable_string("Device Model: ", &buffer[4], buffer[3]);
-        break;
-      case 223:
-        print_printable_string("Hardware Version: ", &buffer[4], buffer[3]);
-        break;
-      case 224:
-        print_printable_string("Firmware Version: ", &buffer[4], buffer[3]);
-        break;
-      default:
-        printf("Unknown response\n");
       }
     }
   }
@@ -203,75 +232,147 @@ void set_float_value(uint8_t type, float value) {
   uint8_t data[4];
 
   memcpy(data, &value, sizeof(float));
-  send_command(HEADER_OUTPUT, CMD_SET, type, data, 4);
+  send_command(HEADER_OUTPUT, CMD_WRITE, type, data, 4);
 }
 
 /* Send byte value i.e. on/off flags */
 void set_byte_value(uint8_t type, uint8_t value) {
   uint8_t data[1] = {value};
 
-  send_command(HEADER_OUTPUT, CMD_SET, type, data, 1);
+  send_command(HEADER_OUTPUT, CMD_WRITE, type, data, 1);
 }
 
 /**
  * Enable output
  */
 void enable_output() { 
-    set_byte_value(OUTPUT_ENABLE, 1); 
+    set_byte_value(REG_W_OUTPUT, 1); 
 }
 
 /**
  * Disable output
  */
 void disable_output() { 
-    set_byte_value(OUTPUT_ENABLE, 0); 
+    set_byte_value(REG_W_OUTPUT, 0); 
 }
 
 /**
- * Enable or disable over-voltage protection
- * @param state The state to set
+ * Set over-voltage protection
+ * @param value The voltage limit
  */
-void set_ovp(uint8_t state) { 
-    set_byte_value(OVP, state); 
+void set_ovp(float value) { 
+    set_float_value(REG_W_OVP, value); 
 }
 
 /**
- * Enable or disable over-current protection
- * @param state The state to set
+ * Set over-current protection
+ * @param value The current limit
  */
-void set_ocp(uint8_t state) { 
-    set_byte_value(OCP, state); 
+void set_ocp(float value) { 
+    set_float_value(REG_W_OCP, value); 
+}
+
+/**
+ * Set over-power protection
+ * @param value The power limit
+ */
+void set_opp(float value) { 
+    set_float_value(REG_W_OPP, value); 
+}
+
+/**
+ * Set over-temperature protection
+ * @param value The temperature limit
+ */
+void set_otp(float value) { 
+    set_float_value(REG_W_OTP, value); 
+}
+
+/**
+ * Set low-voltage protection
+ * @param value The low voltage limit
+ */
+void set_lvp(float value) { 
+    set_float_value(REG_W_LVP, value); 
+}
+
+/**
+ * Recall preset memory (M1-M6)
+ * Note: To truly recall, the official app reads the preset register
+ * and sends it as set voltage and set current. For this CLI tool,
+ * we will send a read request to the preset registers and let receive_response handle it.
+ * But since receive_response isn't designed to send secondary commands,
+ * an atomic CLI tool is better suited to just instructing the user to read the preset and apply manually,
+ * or we simply don't support true "recall", just reading it.
+ * However, since we can parse it, let's just send the read command.
+ */
+void read_preset(int preset) {
+    if (preset < 1 || preset > 6) return;
+    int v_reg = 0xC3 + (preset * 2);
+    send_command(HEADER_OUTPUT, CMD_READ, v_reg, NULL, 0);
+    send_command(HEADER_OUTPUT, CMD_READ, v_reg + 1, NULL, 0);
+}
+
+void write_preset(int preset, float voltage, float current) {
+    if (preset < 1 || preset > 6) return;
+    int v_reg = 0xC3 + (preset * 2);
+    set_float_value(v_reg, voltage);
+    set_float_value(v_reg + 1, current);
 }
 
 /**
  * Get model name
  */
 void get_model_name() {
-  send_command(HEADER_OUTPUT, CMD_GET, MODEL_NAME, 0, 0);
+  send_command(HEADER_OUTPUT, CMD_READ, REG_MODEL, 0, 0);
 }
 
 /**
  * Get hardware version
  */
 void get_hardware_version() {
-  send_command(HEADER_OUTPUT, CMD_GET, HARDWARE_VERSION, 0, 0);
+  send_command(HEADER_OUTPUT, CMD_READ, REG_HW_VERSION, 0, 0);
 }
 
 /**
  * Get firmware version
  */
 void get_firmware_version() {
-  send_command(HEADER_OUTPUT, CMD_GET, FIRMWARE_VERSION, 0, 0);
+  send_command(HEADER_OUTPUT, CMD_READ, REG_FW_VERSION, 0, 0);
 }
 
 /**
- * Initialize the power supply communition
+ * Initialize device communication
  */
 void init_device() {
+  send_command(HEADER_OUTPUT, CMD_SESSION, 0, (uint8_t[]){1}, 1);
   uint8_t baudrate_index = 4; // 115200 baud
-
-  send_command(HEADER_OUTPUT, CMD_XXX_193, 0, (uint8_t[]){1}, 1);
-  send_command(HEADER_OUTPUT, CMD_XXX_176, 0, &baudrate_index, 1);
+  send_command(HEADER_OUTPUT, CMD_BAUD, 0, &baudrate_index, 1);
+  for(int i=0; i<10; i++) receive_response(1); // Drain buffer
+  
+  // Verify device presence
+  send_command(HEADER_OUTPUT, CMD_READ, REG_DEVICE_ADDR, NULL, 0);
+  
+  uint8_t buffer[1024];
+  int found = 0;
+  for (int i = 0; i < 10; i++) {
+      int bytes_read = read(serial_fd, buffer, sizeof(buffer));
+      if (bytes_read > 2) {
+          for (int j = 0; j < bytes_read - 2; j++) {
+              if (buffer[j] == HEADER_INPUT && buffer[j+1] == CMD_READ && buffer[j+2] == REG_DEVICE_ADDR) {
+                  found = 1;
+                  break;
+              }
+          }
+      }
+      if (found) break;
+  }
+  
+  if (!found) {
+      fprintf(stderr, "Error: Device did not respond to initialization handshake.\n");
+      close(serial_fd);
+      exit(EXIT_FAILURE);
+  }
 }
 
 /**
@@ -280,9 +381,8 @@ void init_device() {
  */
 void close_serial(int disconnect) {
   if (disconnect) {
-    send_command(HEADER_OUTPUT, CMD_XXX_193, 0, NULL, 0);
+      send_command(HEADER_OUTPUT, CMD_SESSION, 0, (uint8_t[]){0}, 1);
   }
-
   close(serial_fd);
 }
 
@@ -291,8 +391,11 @@ void close_serial(int disconnect) {
  */
 void usage(const char *program_name) {
   fprintf(stderr,
-          "Usage: %s [-d device] [-u voltage] [-i current] [-x 0|1] [-y "
-          "0|1] [-U] [-I] [-P] [-V] [-o 0|1] [-z] [-v]\n"
+          "Usage: %s [-d device] [-u voltage] [-i current] [-o 0|1]\n"
+          "       Protections: [-x ovp] [-y ocp] [-X opp] [-Y otp] [-L lvp]\n"
+          "       Presets: [-p 1-6] (Use with -u/-i to write, alone to read)\n"
+          "       Readings: [-U] [-I] [-P] [-V]\n"
+          "       Options: [-z] (no disconnect) [-v] (verbose)\n"
           "Version: %s\n",
           program_name, SOFTWARE_VERSION);
   exit(EXIT_FAILURE);
@@ -300,8 +403,9 @@ void usage(const char *program_name) {
 
 int main(int argc, char *argv[]) {
   float voltage = -1.0, current = -1.0;
-  int output = -1, ovp = -1, ocp = -1, get_voltage = 0, get_current = 0,
-      get_power = 0, get_info = 0;
+  float ovp = -1.0, ocp = -1.0, opp = -1.0, otp = -1.0, lvp = -1.0;
+  int output = -1, get_voltage = 0, get_current = 0, get_power = 0, get_info = 0;
+  int preset = -1;
   int opt;
   int disconnect = 1;
   debug = 0;
@@ -310,7 +414,7 @@ int main(int argc, char *argv[]) {
     usage(argv[0]);
   }
 
-  while ((opt = getopt(argc, argv, "d:u:i:x:y:UIPVo:zv")) != -1) {
+  while ((opt = getopt(argc, argv, "d:u:i:x:y:X:Y:L:p:UIPVo:zv")) != -1) {
     switch (opt) {
     case 'd':
       device = optarg;
@@ -322,10 +426,22 @@ int main(int argc, char *argv[]) {
       current = atof(optarg);
       break;
     case 'x':
-      ovp = atoi(optarg);
+      ovp = atof(optarg);
       break;
     case 'y':
-      ocp = atoi(optarg);
+      ocp = atof(optarg);
+      break;
+    case 'X':
+      opp = atof(optarg);
+      break;
+    case 'Y':
+      otp = atof(optarg);
+      break;
+    case 'L':
+      lvp = atof(optarg);
+      break;
+    case 'p':
+      preset = atoi(optarg);
       break;
     case 'U':
       get_voltage = 1;
@@ -359,28 +475,84 @@ int main(int argc, char *argv[]) {
 
   init_device();
 
-  if (voltage >= 0.0)
-    set_float_value(VOLTAGE_SET, voltage);
-  if (current >= 0.0)
-    set_float_value(CURRENT_SET, current);
+  // The firmware ignores commands sent too quickly after connecting
+  usleep(1500000); // 1.5s connection settling delay
+
+  // 1. Set Protections First
+  int protections_changed = 0;
+  if (ovp >= 0.0) { set_ovp(ovp); protections_changed = 1; }
+  if (ocp >= 0.0) { set_ocp(ocp); protections_changed = 1; }
+  if (opp >= 0.0) { set_opp(opp); protections_changed = 1; }
+  if (otp >= 0.0) { set_otp(otp); protections_changed = 1; }
+  if (lvp >= 0.0) { set_lvp(lvp); protections_changed = 1; }
+
+  // Give the device's internal task scheduler time to apply the new protection 
+  // limits before we potentially exceed the old ones with set_voltage
+  if (protections_changed) {
+      usleep(300000); // 300ms
+  }
+
+  // 2. Handle Presets
+  if (preset >= 1 && preset <= 6) {
+    if (voltage >= 0.0 && current >= 0.0) {
+      write_preset(preset, voltage, current);
+    } else {
+      read_preset(preset);
+      for(int i=0; i<10; i++) receive_response(3);
+    }
+  }
+
+  // 3. Set Live Voltage/Current (if not handled by presets)
+  int v_c_changed = 0;
+  if (voltage >= 0.0 && preset == -1) {
+    set_float_value(REG_W_VOLTAGE, voltage);
+    v_c_changed = 1;
+  }
+  if (current >= 0.0 && preset == -1) {
+    set_float_value(REG_W_CURRENT, current);
+    v_c_changed = 1;
+  }
+
+  // Workaround for device bug where first commands after POR/output-off might be ignored.
+  // We send the setpoints a second time, just like the official app and Python driver do.
+  if (v_c_changed) {
+      usleep(500000); // 500ms delay between first and second send
+      if (voltage >= 0.0 && preset == -1) {
+          set_float_value(REG_W_VOLTAGE, voltage);
+      }
+      if (current >= 0.0 && preset == -1) {
+          set_float_value(REG_W_CURRENT, current);
+      }
+  }
+
+  // Allow the device to lock in the target voltage/current before turning on output.
+  // Turning it on instantly after setting it trips REG_W_OCP on the first boot because
+  // the CC loop needs time to apply the new limits.
+  if (v_c_changed && output == 1) {
+      usleep(500000); // 500ms DAC settling delay
+  }
+
+  // 4. Enable/Disable Output
   if (output == 1)
     enable_output();
   if (output == 0)
     disable_output();
-  if (ovp >= 0)
-    set_ovp(ovp);
-  if (ocp >= 0)
-    set_ocp(ocp);
 
-  if (get_voltage || get_current || get_power)
-    receive_response(get_voltage + get_current + get_power);
+  if (get_voltage || get_current || get_power) {
+    uint8_t flags = get_voltage + get_current + get_power;
+    usleep(500000); // 500ms for power supply to physically respond
+    send_command(HEADER_OUTPUT, CMD_READ, 255, (uint8_t[]){0}, 1);
+    usleep(50000); // 50ms to allow all 144 bytes to arrive in OS buffer
+    for(int i=0; i<20; i++) receive_response(flags);
+  }
+  
   if (get_info) {
     get_model_name();
-    receive_response(7);
+    for(int i=0; i<5; i++) receive_response(7);
     get_hardware_version();
-    receive_response(7);
+    for(int i=0; i<5; i++) receive_response(7);
     get_firmware_version();
-    receive_response(7);
+    for(int i=0; i<5; i++) receive_response(7);
   }
 
   close_serial(disconnect);
